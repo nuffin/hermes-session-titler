@@ -1,0 +1,15 @@
+[project]
+name = "hermes-session-titler"
+version = "1.1.0"
+description = "Hermes Agent plugin — auto-generate or retitle session titles"
+authors = [{ name = "Hauzer S. Lee" }]
+license = { text = "MIT" }
+readme = "README.md"
+requires-python = ">=3.10"
+
+[build-system]
+requires = ["setuptools"]
+build-backend = "setuptools.backends._legacy:_Backend"
+
+[tool.setuptools.packages.find]
+include = ["plugins/*"]

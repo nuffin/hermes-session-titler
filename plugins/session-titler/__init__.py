@@ -177,9 +177,6 @@ def _generate_title(cli: Any, command: str) -> str | None:
 
 def _on_pre_command(**kw: Any) -> None:
     """pre_command hook handler — fires before any slash command handler."""
-    # Stash cli for /retitle handler
-    _stash_cli(**kw)
-
     command = kw.get("command")
     if command not in _HANDLED_COMMANDS:
         return
@@ -255,8 +252,8 @@ def _handle_retitle_command(args: str) -> str:
     """Slash command handler for /retitle — regenerate session title immediately."""
     _log("/retitle command invoked")
 
-    # _cli_ref is set by the pre_command hook when /retitle or /quit fires
-    cli = _cli_ref
+    from hermes_cli.plugins import get_plugin_manager
+    cli = getattr(get_plugin_manager(), "_cli_ref", None)
     if cli is None:
         return "No CLI context available — use /quit to generate title instead."
 
@@ -264,21 +261,6 @@ def _handle_retitle_command(args: str) -> str:
     if title:
         return f"Session title updated: {title}"
     return "Title generation failed — check logs."
-
-
-# ---- stash the current cli reference for slash command handlers -------------
-# The pre_command hook receives cli in **kw. We stash it so the /retitle
-# handler (which only receives args: str from the CLI dispatcher) can reach it.
-
-_cli_ref = None
-
-
-def _stash_cli(**kw: Any) -> None:
-    """Store the current cli reference from pre_command hook context."""
-    global _cli_ref
-    cli = kw.get("cli")
-    if cli is not None:
-        _cli_ref = cli
 
 
 # ---- plugin entry point -----------------------------------------------------

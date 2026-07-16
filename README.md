@@ -1,34 +1,18 @@
-# Hermes Session Titler
+# hermes-session-titler
 
-A Hermes Agent plugin that auto-generates descriptive session titles.
+Auto-generate descriptive session titles for Hermes Agent.  Generates a short
+title from the full conversation transcript when you `/quit`, and provides
+`/retitle` for mid-session regeneration.
 
-## Features
+> No more "untitled session 47" in your dashboard.
 
-- **Auto-title on `/quit`** — generates a short descriptive title from the full conversation transcript before the session closes
-- **`/retitle` command** — manually regenerate the session title mid-session
-- **Smart skip** — avoids unnecessary LLM calls when resuming an old session and immediately quitting (no new messages since session start)
-- **Full-context generation** — uses the same LLM model as your conversation to generate accurate titles
-
-## Installation
+## Install
 
 ```bash
-# Clone the repo
-git clone https://github.com/your-username/hermes-session-titler.git ~/studio/hermes/projects/hermes-session-titler
-
-# Symlink into your Hermes profile
-mkdir -p ~/.hermes/personal/plugins
-ln -sf ~/studio/hermes/projects/hermes-session-titler/plugins/session-titler ~/.hermes/personal/plugins/session-titler
-
-# Or for a specific profile:
-mkdir -p ~/.hermes/profiles/<profile>/personal/plugins
-ln -sf ~/studio/hermes/projects/hermes-session-titler/plugins/session-titler ~/.hermes/profiles/<profile>/personal/plugins/session-titler
-
-# Symlink into Hermes plugins directory
-mkdir -p ~/.hermes/plugins
-ln -sf ~/.hermes/personal/plugins/session-titler ~/.hermes/plugins/session-titler
+pip install hermes-session-titler
 ```
 
-Enable in your profile's `config.yaml`:
+Then add to `config.yaml`:
 
 ```yaml
 plugins:
@@ -36,17 +20,55 @@ plugins:
     - session-titler
 ```
 
+Restart Hermes.
+
 ## Usage
 
-- **`/quit`** — title is auto-generated before the session closes
+- **`/quit`** — title is auto-generated from the full conversation before the session closes
 - **`/retitle`** — manually regenerate the title mid-session
 
 The plugin logs to `~/.hermes/personal/logs/session-titler.log`.
 
-## Requirements
+### Smart skip
 
-- Hermes Agent (by Nous Research)
-- The plugin uses `agent.auxiliary_client.call_llm` for title generation (same model as your conversation)
+If you resume an old session and immediately `/quit` without adding any new
+messages, title generation is skipped — no unnecessary LLM calls.
+
+## How it works
+
+```
+/quit or /retitle
+  │
+  ├─ Read full conversation history from cli.conversation_history
+  ├─ Build transcript (~4500 chars, role-labeled)
+  ├─ Call auxiliary LLM with titling prompt (max 50 tokens, temp 0.3)
+  ├─ Clean the response (strip quotes, "Title:" prefix, cap at 80 chars)
+  └─ Write to session DB via SessionDB.set_session_title()
+```
+
+Uses the agent's own model through `agent.auxiliary_client.call_llm` — no extra
+provider setup.  Titles appear immediately in the TUI session picker and
+dashboard.
+
+## Design note
+
+CLI context is resolved from `PluginManager._cli_ref` on every call rather than
+stashed in a module-level variable.  This means `/retitle` survives
+`importlib.reload` from tools like `hermes-evolve`.
+
+## Config
+
+No configuration required.  The plugin registers the `/retitle` command and
+hooks into `pre_command` (for `/quit` titles) and `on_session_start` (for the
+message-count baseline).
+
+## Development
+
+```bash
+git clone https://github.com/nuffin/hermes-session-titler
+cd hermes-session-titler
+pip install -e .
+```
 
 ## License
 

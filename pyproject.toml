@@ -1,15 +1,16 @@
+[build-system]
+requires = ["setuptools>=68.0"]
+build-backend = "setuptools.build_meta"
+
 [project]
 name = "hermes-session-titler"
-version = "1.1.0"
-description = "Hermes Agent plugin — auto-generate or retitle session titles"
-authors = [{ name = "Hauzer S. Lee" }]
-license = { text = "MIT" }
-readme = "README.md"
-requires-python = ">=3.10"
+version = "1.0.0"
+description = "Auto-generate or retitle Hermes session titles from conversation history"
+requires-python = ">=3.11"
+dependencies = []
 
-[build-system]
-requires = ["setuptools"]
-build-backend = "setuptools.backends._legacy:_Backend"
+[project.entry-points."hermes_agent.plugins"]
+session-titler = "hermes_session_titler:register"
 
 [tool.setuptools.packages.find]
-include = ["plugins/*"]
+include = ["hermes_session_titler*"]

@@ -6,6 +6,7 @@ build-backend = "setuptools.build_meta"
 name = "hermes-session-titler"
 version = "1.0.0"
 description = "Auto-generate or retitle Hermes session titles from conversation history"
+readme = "README.md"
 requires-python = ">=3.11"
 dependencies = []
 

@@ -56,6 +56,20 @@ CLI context is resolved from `PluginManager._cli_ref` on every call rather than
 stashed in a module-level variable.  This means `/retitle` survives
 `importlib.reload` from tools like `hermes-evolve`.
 
+## Upstream dependency
+
+This plugin requires the `pre_command` hook, which is **not yet merged** into
+upstream Hermes Agent.  Until the PR lands, you must run a build that includes:
+
+> **PR #46581** — feat(plugins): add pre_command, post_command, and on_quit plugin hooks
+> https://github.com/NousResearch/hermes-agent/pull/46581
+
+Without this PR, the `pre_command` hook is absent from `VALID_HOOKS` and never
+fires — the plugin will load without errors but `/quit` title generation will
+not trigger.
+
+Once #46581 is merged, this section can be removed.
+
 ## Config
 
 No configuration required.  The plugin registers the `/retitle` command and

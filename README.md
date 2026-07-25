@@ -42,5 +42,5 @@ MIT
 
 | Role | Repo | PyPI |
 |------|------|------|
-| Plugin code (this repo) | `hermes-session-titler` | — |
-| Pip wrapper | `hermes-session-titler-pip` | `hermes-session-titler` |
+| Plugin code (this repo) | [hermes-session-titler](https://github.com/nuffin/hermes-session-titler) | — |
+| Pip wrapper | [hermes-session-titler-pip](https://github.com/nuffin/hermes-session-titler-pip) | [hermes-session-titler](https://pypi.org/project/hermes-session-titler/) |

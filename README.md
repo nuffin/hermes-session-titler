@@ -1,15 +1,21 @@
 # hermes-session-titler
 
-Auto-generate descriptive session titles for Hermes Agent.  Generates a short
+Auto-generate descriptive session titles for Hermes Agent. Generates a short
 title from the full conversation transcript when you `/quit`, and provides
 `/retitle` for mid-session regeneration.
 
-> No more "untitled session 47" in your dashboard.
-
 ## Install
 
+Symlink or clone into `~/.hermes/plugins/`:
+
 ```bash
-pip install hermes-session-titler
+ln -sf /path/to/hermes-session-titler ~/.hermes/plugins/session-titler
+```
+
+Or install via pip:
+
+```bash
+pip install hermes-session-titler-pip
 ```
 
 Then add to `config.yaml`:
@@ -26,63 +32,6 @@ Restart Hermes.
 
 - **`/quit`** — title is auto-generated from the full conversation before the session closes
 - **`/retitle`** — manually regenerate the title mid-session
-
-The plugin logs to `~/.hermes/personal/logs/session-titler.log`.
-
-### Smart skip
-
-If you resume an old session and immediately `/quit` without adding any new
-messages, title generation is skipped — no unnecessary LLM calls.
-
-## How it works
-
-```
-/quit or /retitle
-  │
-  ├─ Read full conversation history from cli.conversation_history
-  ├─ Build transcript (~4500 chars, role-labeled)
-  ├─ Call auxiliary LLM with titling prompt (max 50 tokens, temp 0.3)
-  ├─ Clean the response (strip quotes, "Title:" prefix, cap at 80 chars)
-  └─ Write to session DB via SessionDB.set_session_title()
-```
-
-Uses the agent's own model through `agent.auxiliary_client.call_llm` — no extra
-provider setup.  Titles appear immediately in the TUI session picker and
-dashboard.
-
-## Design note
-
-CLI context is resolved from `PluginManager._cli_ref` on every call rather than
-stashed in a module-level variable.  This means `/retitle` survives
-`importlib.reload` from tools like `hermes-evolve`.
-
-## Upstream dependency
-
-This plugin requires the `pre_command` hook, which is **not yet merged** into
-upstream Hermes Agent.  Until the PR lands, you must run a build that includes:
-
-> **PR #46581** — feat(plugins): add pre_command, post_command, and on_quit plugin hooks
-> https://github.com/NousResearch/hermes-agent/pull/46581
-
-Without this PR, the `pre_command` hook is absent from `VALID_HOOKS` and never
-fires — the plugin will load without errors but `/quit` title generation will
-not trigger.
-
-Once #46581 is merged, this section can be removed.
-
-## Config
-
-No configuration required.  The plugin registers the `/retitle` command and
-hooks into `pre_command` (for `/quit` titles) and `on_session_start` (for the
-message-count baseline).
-
-## Development
-
-```bash
-git clone https://github.com/nuffin/hermes-session-titler
-cd hermes-session-titler
-pip install -e .
-```
 
 ## License
 

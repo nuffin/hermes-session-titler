@@ -15,7 +15,7 @@ ln -sf /path/to/hermes-session-titler ~/.hermes/plugins/session-titler
 Or install via pip:
 
 ```bash
-pip install hermes-session-titler-pip
+pip install hermes-session-titler
 ```
 
 Then add to `config.yaml`:

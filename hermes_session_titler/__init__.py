@@ -57,8 +57,8 @@ _log("plugin loaded")
 _session_initial_counts: dict[str, int] = {}
 
 
-def _on_session_start(**kw: Any) -> None:
-    """on_session_start hook — records the DB message_count as baseline."""
+def _record_baseline(**kw: Any) -> None:
+    """Record the DB message_count as baseline for a session (start or resume)."""
     session_id = kw.get("session_id")
     if not session_id or session_id in _session_initial_counts:
         return
@@ -71,6 +71,16 @@ def _on_session_start(**kw: Any) -> None:
             _log(f"baseline: session={session_id} initial_msg_count={_session_initial_counts[session_id]}")
     except Exception as exc:
         _log_err(f"could not get baseline message_count: {exc}")
+
+
+def _on_session_start(**kw: Any) -> None:
+    """on_session_start hook — records the DB message_count as baseline."""
+    _record_baseline(**kw)
+
+
+def _on_session_resume(**kw: Any) -> None:
+    """on_session_resume hook — records the DB message_count as baseline."""
+    _record_baseline(**kw)
 
 
 # ---- full-conversation title prompt ----------------------------------------
@@ -278,4 +288,5 @@ def register(ctx: Any) -> None:
     )
 
     ctx.register_hook("on_session_start", _on_session_start)
+    ctx.register_hook("on_session_resume", _on_session_resume)
     ctx.register_hook("pre_command", _on_pre_command)

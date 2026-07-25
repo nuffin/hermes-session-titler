@@ -36,3 +36,11 @@ Restart Hermes.
 ## License
 
 MIT
+
+
+## Repositories
+
+| Role | Repo | PyPI |
+|------|------|------|
+| Plugin code (this repo) | `hermes-session-titler` | — |
+| Pip wrapper | `hermes-session-titler-pip` | `hermes-session-titler` |

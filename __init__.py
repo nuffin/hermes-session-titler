@@ -127,9 +127,28 @@ def _generate_title(cli: Any, command: str) -> str | None:
     session_id = getattr(cli, "session_id", None)
     conv = getattr(cli, "conversation_history", None)
 
-    if not session_db or not session_id or not conv:
-        _log(f"missing data: session_db={bool(session_db)}, session_id={bool(session_id)}, conv={bool(conv)} — skipping")
+    if not session_db or not session_id:
+        _log(f"missing data: session_db={bool(session_db)}, session_id={bool(session_id)} — skipping")
         return None
+
+    # If conversation_history is empty, try loading from session DB.
+    # Covers the /retitle path where _cli_ref's history may not be populated yet.
+    if not conv:
+        try:
+            loaded = session_db.get_messages_as_conversation(
+                session_id,
+                include_ancestors=True,
+                repair_alternation=True,
+            )
+            if loaded:
+                conv = loaded
+                _log(f"loaded {len(conv)} messages from DB for session={session_id}")
+            else:
+                _log(f"no messages in session {session_id} — skipping title generation")
+                return None
+        except Exception as exc:
+            _log_err(f"could not load messages from DB: {exc}")
+            return None
 
     _log(f"title: session={session_id} conv={len(conv)} command={command}")
 

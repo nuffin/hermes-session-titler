@@ -4,3 +4,5 @@ description: "Auto-generate session titles on /quit and via /retitle command. Ru
 author: "Hauzer S. Lee"
 hooks:
   - pre_command
+  - on_session_start
+  - on_session_resume

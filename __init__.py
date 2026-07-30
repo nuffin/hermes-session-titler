@@ -152,6 +152,17 @@ def _generate_title(cli: Any, command: str) -> str | None:
 
     _log(f"title: session={session_id} conv={len(conv)} command={command}")
 
+    # Log: starting rebuild
+    if command == "retitle":
+        _log(f"starting title rebuild: session={session_id} (manual /retitle)")
+    elif command in ("quit", "exit"):
+        _log(f"starting title rebuild: session={session_id} (auto on /quit)")
+
+    # Log: enrichment phase — processing each role's contribution
+    user_msgs = sum(1 for m in conv if m.get("role") == "user")
+    asst_msgs = sum(1 for m in conv if m.get("role") == "assistant")
+    _log(f"enriching: processing {len(conv)} messages ({user_msgs} user, {asst_msgs} assistant) for title generation")
+
     # For /quit, skip if no new messages since session start.
     # For /title, always generate regardless.
     if command in ("quit", "exit"):

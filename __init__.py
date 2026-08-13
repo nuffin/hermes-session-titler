@@ -1,18 +1,17 @@
-"""session-titler plugin — auto-generate or retitle session titles.
+"""session-titler plugin — finalize-aware, topic-aware session titles.
 
-Triggers on the ``pre_command`` hook when the user runs ``/quit`` or ``/exit``,
-and provides a ``/retitle`` command for mid-session title regeneration.
-Generates a short descriptive title from the FULL conversation history using
-the agent's LLM, then writes it to the session DB (overwrites any old title).
-
-Skips title generation on /quit if no new messages were added since the session started
-(avoids unnecessary LLM calls when resuming an old session and immediately quitting).
+Registers ``on_session_finalize`` so normal EOF/Ctrl-D teardown is covered, with
+``pre_command`` retained as a compatibility path for ``/quit`` and ``/exit``.
+``/retitle`` runs the same DB-first generation pipeline manually. Title context
+combines the existing title, chronological topic summaries, and durable session
+history; automatic writes use provenance-aware APIs when the core provides them.
 """
 
 from __future__ import annotations
 
 import datetime
 import os
+import threading
 import traceback
 from pathlib import Path
 from typing import Any
@@ -55,6 +54,9 @@ _log("plugin loaded")
 # new messages since the session was resumed / created.
 
 _session_initial_counts: dict[str, int] = {}
+_generated_sessions: set[str] = set()
+_generation_in_progress: set[str] = set()
+_generation_lock = threading.Lock()
 
 
 def _record_baseline(**kw: Any) -> None:
@@ -86,205 +88,275 @@ def _on_session_resume(**kw: Any) -> None:
 # ---- full-conversation title prompt ----------------------------------------
 
 _TITLE_PROMPT = (
-    "You are a session titling assistant. Given the following conversation transcript, "
-    "generate a short, descriptive title (3-10 words) that captures the MAIN topic or outcome "
-    "of the ENTIRE conversation. Return ONLY the title text — no quotes, no prefixes, no "
-    "punctuation at the end."
+    "You are a session titling assistant. Generate a complete, concise title (3-10 words) "
+    "for the whole session. Preserve still-valid key concepts from the existing title. "
+    "When the session has multiple topics, represent the most important 2-3 topics and "
+    "retain at least one session-level core keyword. Use the chronological topic summaries "
+    "and durable transcript together. Return ONLY the title text — no quotes, prefixes, or "
+    "ending punctuation."
 )
 
 
-def _build_conversation_summary(conv: list) -> str:
-    """Concatenate conversation into a readable transcript, truncated to ~4000 chars."""
-    parts: list[str] = []
-    total = 0
-    for msg in conv:
-        role = msg.get("role", "")
-        content = msg.get("content", "")
-        if not content or not isinstance(content, str):
+def _message_text(message: dict[str, Any]) -> str:
+    content = message.get("content", "")
+    return content if isinstance(content, str) else ""
+
+
+def _build_conversation_summary(conv: list, max_chars: int = 18000) -> str:
+    """Build a balanced transcript that retains evidence from the whole session."""
+    lines = []
+    for message in conv:
+        content = _message_text(message).strip()
+        if not content:
             continue
+        role = message.get("role", "")
         label = "User" if role == "user" else "Assistant"
-        snippet = content[:300]
-        line = f"{label}: {snippet}"
-        if total + len(line) > 4500:
-            parts.append(f"... (conversation truncated, {len(conv)} messages total)")
-            break
-        parts.append(line)
-        total += len(line)
-    return "\n\n".join(parts)
+        lines.append(f"{label}: {content}")
+    if not lines:
+        return ""
+
+    full = "\n\n".join(lines)
+    if len(full) <= max_chars:
+        return full
+
+    # Sample evenly across the entire durable history instead of consuming only
+    # the beginning. Every sampled message receives an equal character budget.
+    sample_count = min(len(lines), 24)
+    if sample_count == 1:
+        indices = [0]
+    else:
+        indices = sorted({round(index * (len(lines) - 1) / (sample_count - 1)) for index in range(sample_count)})
+    budget = max(160, max_chars // max(1, len(indices)) - 32)
+    sampled = [lines[index][:budget] for index in indices]
+    return "\n\n".join(sampled) + f"\n\n[Balanced sample of {len(lines)} transcript messages]"
 
 
-# ---- hook handler -----------------------------------------------------------
-
-# ---- slash command handler: /title -----------------------------------------
-# Manually trigger title regeneration mid-session (without quitting).
-
-_HANDLED_COMMANDS = frozenset({"quit", "exit", "title"})
-
-
-def _generate_title(cli: Any, command: str) -> str | None:
-    """Core title generation logic. Returns the new title or None on failure."""
-    session_db = getattr(cli, "_session_db", None)
-    session_id = getattr(cli, "session_id", None)
-    conv = getattr(cli, "conversation_history", None)
-
-    if not session_db or not session_id:
-        _log(f"missing data: session_db={bool(session_db)}, session_id={bool(session_id)} — skipping")
-        return None
-
-    # If conversation_history is empty, try loading from session DB.
-    # Covers the /retitle path where _cli_ref's history may not be populated yet.
-    if not conv:
+def _load_durable_history(session_db: Any, session_id: str) -> list:
+    loader = getattr(session_db, "get_messages_as_conversation", None)
+    if loader is None:
+        return []
+    attempts = (
+        {"include_ancestors": True, "include_inactive": True, "repair_alternation": True},
+        {"include_ancestors": True, "repair_alternation": True},
+        {"include_ancestors": True},
+        {},
+    )
+    for kwargs in attempts:
         try:
-            loaded = session_db.get_messages_as_conversation(
-                session_id,
-                include_ancestors=True,
-                repair_alternation=True,
-            )
-            if loaded:
-                conv = loaded
-                _log(f"loaded {len(conv)} messages from DB for session={session_id}")
-            else:
-                _log(f"no messages in session {session_id} — skipping title generation")
-                return None
+            loaded = loader(session_id, **kwargs)
+            return list(loaded or [])
+        except TypeError:
+            continue
         except Exception as exc:
             _log_err(f"could not load messages from DB: {exc}")
+            return []
+    return []
+
+
+def _load_topics(session_db: Any, session_id: str) -> list[dict[str, Any]]:
+    getter = getattr(session_db, "get_topic_title_context", None)
+    if getter is None:
+        getter = getattr(session_db, "get_topics", None)
+    if getter is None:
+        return []
+    try:
+        topics = list(getter(session_id) or [])
+    except Exception as exc:
+        _log_err(f"could not load session topics: {exc}")
+        return []
+    return sorted(topics, key=lambda topic: (topic.get("created_at") is None, topic.get("created_at", 0), topic.get("id", 0)))
+
+
+def _topic_detail(session_db: Any, session_id: str, topic: dict[str, Any]) -> str:
+    summary = topic.get("summary")
+    if isinstance(summary, str) and summary.strip():
+        return summary.strip()
+    getter = getattr(session_db, "get_topic_messages", None)
+    if getter is None or topic.get("id") is None:
+        return "(no summary available)"
+    for kwargs in ({"include_inactive": True}, {}):
+        try:
+            topic_messages = getter(session_id, topic["id"], **kwargs)
+            detail = _build_conversation_summary(list(topic_messages or []), max_chars=2400)
+            return detail or "(no summary available)"
+        except TypeError:
+            continue
+        except Exception as exc:
+            _log_err(f"could not load messages for topic {topic.get('id')}: {exc}")
+            break
+    return "(no summary available)"
+
+
+def _build_title_context(session_db: Any, session_id: str, session: dict[str, Any], fallback_conv: list | None) -> tuple[str, list]:
+    durable = _load_durable_history(session_db, session_id)
+    conv = durable or list(fallback_conv or [])
+    parts = [
+        "Existing session title and provenance:",
+        f"title={session.get('title') or '(none)'}",
+        f"source={session.get('title_source') or '(unknown)'}",
+    ]
+    topics = _load_topics(session_db, session_id)
+    if topics:
+        parts.append("\nTopics in chronological order:")
+        for index, topic in enumerate(topics, 1):
+            metadata = (
+                f"state={topic.get('state') or 'unknown'}, "
+                f"messages={topic.get('message_count', 0)}"
+            )
+            parts.append(
+                f"{index}. {topic.get('title') or '(untitled)'} [{metadata}]\n"
+                f"   {_topic_detail(session_db, session_id, topic)}"
+            )
+    transcript = _build_conversation_summary(conv)
+    if transcript:
+        parts.extend(("\nDurable session transcript (balanced across the whole session):", transcript))
+    return "\n".join(parts), conv
+
+
+def _write_title(session_db: Any, session_id: str, title: str) -> bool:
+    auto_writer = getattr(session_db, "set_auto_title", None)
+    if auto_writer is not None:
+        source = getattr(session_db, "TITLE_SOURCE_LLM", "llm")
+        try:
+            return bool(auto_writer(session_id, title, source=source))
+        except AttributeError:
+            pass
+    legacy_auto_writer = getattr(session_db, "set_auto_title_if_empty", None)
+    if legacy_auto_writer is not None:
+        return bool(legacy_auto_writer(session_id, title))
+    # Oldest cores have no provenance-safe automatic write. Never replace a
+    # pre-existing title through that compatibility path.
+    session = session_db.get_session(session_id) or {}
+    if session.get("title"):
+        return False
+    return bool(session_db.set_session_title(session_id, title))
+
+
+def _clean_title(response: Any) -> str:
+    title = (response.choices[0].message.content or "").strip().strip("\"'")
+    if title.lower().startswith("title:"):
+        title = title[6:].strip()
+    if len(title) > 80:
+        title = title[:77] + "..."
+    return title
+
+
+# ---- hook and command handlers ---------------------------------------------
+
+_HANDLED_COMMANDS = frozenset({"quit", "exit"})
+
+
+def _generate_title_for_session(
+    session_db: Any,
+    session_id: str,
+    *,
+    command: str,
+    fallback_conv: list | None = None,
+    runtime: Any = None,
+) -> str | None:
+    """Run the unified DB-first title pipeline for one session."""
+    session = session_db.get_session(session_id) if hasattr(session_db, "get_session") else None
+    if not session:
+        _log(f"session {session_id} not found — skipping title generation")
+        return None
+    if session.get("title") and session.get("title_source") in ("user", None):
+        _log(f"human or legacy title already holds session={session_id} — preserving")
+        return None
+
+    context, conv = _build_title_context(session_db, session_id, session, fallback_conv)
+    message_count = session.get("message_count")
+    if message_count == 0 and not conv:
+        _log(f"no messages in session {session_id} — skipping title generation")
+        return None
+    if not conv and not _load_topics(session_db, session_id):
+        _log(f"no trustworthy title context for session {session_id} — preserving existing title")
+        return None
+
+    baseline = _session_initial_counts.get(session_id)
+    if command != "retitle" and baseline is not None and message_count is not None and message_count <= baseline:
+        _log(f"no new messages (db={message_count}, baseline={baseline}) — skipping")
+        return None
+
+    with _generation_lock:
+        if session_id in _generated_sessions or session_id in _generation_in_progress:
+            _log(f"title already generated or in progress for session={session_id} — skipping duplicate")
             return None
-
-    _log(f"title: session={session_id} conv={len(conv)} command={command}")
-
-    # Log: starting rebuild
-    if command == "retitle":
-        _log(f"starting title rebuild: session={session_id} (manual /retitle)")
-    elif command in ("quit", "exit"):
-        _log(f"starting title rebuild: session={session_id} (auto on /quit)")
-
-    # Log: enrichment phase — processing each role's contribution
-    user_msgs = sum(1 for m in conv if m.get("role") == "user")
-    asst_msgs = sum(1 for m in conv if m.get("role") == "assistant")
-    _log(f"enriching: processing {len(conv)} messages ({user_msgs} user, {asst_msgs} assistant) for title generation")
-
-    # For /quit, skip if no new messages since session start.
-    # For /title, always generate regardless.
-    if command in ("quit", "exit"):
-        initial = _session_initial_counts.get(session_id, len(conv))
-        if len(conv) <= initial:
-            _log(f"no new messages (conv={len(conv)}, baseline={initial}) — skipping")
-            return None
+        _generation_in_progress.add(session_id)
 
     try:
-        transcript = _build_conversation_summary(conv)
-
-        runtime: Any = None
-        agent = getattr(cli, "agent", None)
-        if agent is not None:
-            runtime = getattr(agent, "_runtime", None)
-
+        _log(f"starting title rebuild: session={session_id} command={command}")
         from agent.auxiliary_client import call_llm
-
-        messages = [
-            {"role": "system", "content": _TITLE_PROMPT},
-            {"role": "user", "content": f"Conversation transcript:\n\n{transcript}"},
-        ]
 
         response = call_llm(
             task="quit_title_generation",
-            messages=messages,
+            messages=[
+                {"role": "system", "content": _TITLE_PROMPT},
+                {"role": "user", "content": context},
+            ],
             max_tokens=50,
             temperature=0.3,
             timeout=30.0,
             main_runtime=runtime,
         )
-
-        title = (response.choices[0].message.content or "").strip().strip("\"'")
-        if title.lower().startswith("title:"):
-            title = title[6:].strip()
-        if len(title) > 80:
-            title = title[:77] + "..."
-
+        title = _clean_title(response)
         if not title:
-            _log("LLM returned empty title — skipping")
+            _log("LLM returned empty title — preserving existing title")
             return None
-
-        session_db.set_session_title(session_id, title)
+        if not _write_title(session_db, session_id, title):
+            _log(f"title write declined by provenance policy for session={session_id}")
+            return None
+        with _generation_lock:
+            _generated_sessions.add(session_id)
         _log(f"set title='{title}' (session={session_id})")
         return title
-
     except Exception as exc:
         _log_err(f"title generation failed: {exc}")
         _log_err(traceback.format_exc())
         return None
+    finally:
+        with _generation_lock:
+            _generation_in_progress.discard(session_id)
+
+
+def _generate_title(cli: Any, command: str) -> str | None:
+    """Generate from a live CLI while keeping durable DB history authoritative."""
+    session_db = getattr(cli, "_session_db", None)
+    session_id = getattr(cli, "session_id", None)
+    if not session_db or not session_id:
+        _log(f"missing data: session_db={bool(session_db)}, session_id={bool(session_id)} — skipping")
+        return None
+    runtime = None
+    agent = getattr(cli, "agent", None)
+    if agent is not None:
+        runtime = getattr(agent, "_runtime", None)
+    return _generate_title_for_session(
+        session_db,
+        session_id,
+        command=command,
+        fallback_conv=getattr(cli, "conversation_history", None),
+        runtime=runtime,
+    )
 
 
 def _on_pre_command(**kw: Any) -> None:
-    """pre_command hook handler — fires before any slash command handler."""
-    command = kw.get("command")
-    if command not in _HANDLED_COMMANDS:
+    """Compatibility path for /quit and /exit before CLI teardown."""
+    if kw.get("command") not in _HANDLED_COMMANDS:
         return
-
     cli = kw.get("cli")
-    if not cli:
-        _log("no cli object — skipping")
+    if cli is not None:
+        _generate_title(cli, kw.get("command"))
+
+
+def _on_session_finalize(**kw: Any) -> None:
+    """Finalize handler that requires only the durable session ID and SessionDB."""
+    session_id = kw.get("session_id")
+    if not session_id:
         return
-
-    session_db = getattr(cli, "_session_db", None)
-    session_id = getattr(cli, "session_id", None)
-    conv = getattr(cli, "conversation_history", None)
-
-    if not session_db or not session_id or not conv:
-        _log(f"missing data: session_db={bool(session_db)}, session_id={bool(session_id)}, conv={bool(conv)} — skipping")
-        return
-
-    _log(f"quit: session={session_id} conv={len(conv)}")
-
-    # Skip if no new messages since session start (avoids unnecessary LLM calls
-    # when resuming an old session and immediately quitting).
-    initial = _session_initial_counts.get(session_id, len(conv))
-    if len(conv) <= initial:
-        _log(f"no new messages (conv={len(conv)}, baseline={initial}) — skipping")
-        return
-
     try:
-        # Build conversation transcript
-        transcript = _build_conversation_summary(conv)
-
-        # Get main runtime for LLM call (same model as the conversation)
-        runtime: Any = None
-        agent = getattr(cli, "agent", None)
-        if agent is not None:
-            runtime = getattr(agent, "_runtime", None)
-
-        # Call LLM with full conversation context
-        from agent.auxiliary_client import call_llm
-
-        messages = [
-            {"role": "system", "content": _TITLE_PROMPT},
-            {"role": "user", "content": f"Conversation transcript:\n\n{transcript}"},
-        ]
-
-        response = call_llm(
-            task="quit_title_generation",
-            messages=messages,
-            max_tokens=50,
-            temperature=0.3,
-            timeout=30.0,
-            main_runtime=runtime,
-        )
-
-        title = (response.choices[0].message.content or "").strip().strip("\"'")
-        if title.lower().startswith("title:"):
-            title = title[6:].strip()
-        if len(title) > 80:
-            title = title[:77] + "..."
-
-        if not title:
-            _log("LLM returned empty title — skipping")
-            return
-
-        session_db.set_session_title(session_id, title)
-        _log(f"set title='{title}' (session={session_id})")
-
+        from hermes_state import SessionDB
+        _generate_title_for_session(SessionDB(), session_id, command="finalize")
     except Exception as exc:
-        _log_err(f"title generation failed: {exc}")
+        _log_err(f"finalize title generation failed: {exc}")
         _log_err(traceback.format_exc())
 
 
@@ -307,7 +379,7 @@ def _handle_retitle_command(args: str) -> str:
 
 
 def register(ctx: Any) -> None:
-    """Register the pre_command and on_session_start hooks, plus /title command."""
+    """Register lifecycle hooks and the manual /retitle command."""
     _log("registering hooks and commands")
 
     ctx.register_command(
@@ -320,3 +392,4 @@ def register(ctx: Any) -> None:
     ctx.register_hook("on_session_start", _on_session_start)
     ctx.register_hook("on_session_resume", _on_session_resume)
     ctx.register_hook("pre_command", _on_pre_command)
+    ctx.register_hook("on_session_finalize", _on_session_finalize)

@@ -1,8 +1,9 @@
 name: session-titler
-version: 1.1.0
-description: "Auto-generate session titles on /quit and via /retitle command. Runs via pre_command hook — zero overhead on normal turns."
+version: 1.2.0
+description: "Generate topic-aware session titles on finalize and via /retitle."
 author: "Hauzer S. Lee"
 hooks:
   - pre_command
   - on_session_start
   - on_session_resume
+  - on_session_finalize

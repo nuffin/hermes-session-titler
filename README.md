@@ -1,8 +1,9 @@
 # hermes-session-titler
 
-Auto-generate descriptive session titles for Hermes Agent. Generates a short
-title from the full conversation transcript when you `/quit`, and provides
-`/retitle` for mid-session regeneration.
+Auto-generate descriptive session titles for Hermes Agent. On every normal
+session finalization (including EOF/Ctrl-D and `/quit`), it builds a complete
+title from the existing title, chronological topic summaries, and durable DB
+history. `/retitle` runs the same pipeline manually.
 
 ## Install
 
@@ -30,8 +31,13 @@ Restart Hermes.
 
 ## Usage
 
-- **`/quit`** — title is auto-generated from the full conversation before the session closes
-- **`/retitle`** — manually regenerate the title mid-session
+- **EOF/Ctrl-D or `/quit`** — one automatic, topic-aware title attempt runs at finalization
+- **`/retitle`** — manually run the same DB-first title pipeline
+
+Automatic and manual plugin retitling preserve titles whose provenance is
+`user`. On older Hermes cores without provenance support, any existing title is
+also preserved conservatively. Topic summaries and provenance APIs are
+capability-detected, so the plugin remains compatible with older cores.
 
 ## License
 

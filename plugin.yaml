@@ -5,5 +5,4 @@ author: "Hauzer S. Lee"
 hooks:
   - pre_command
   - on_session_start
-  - on_session_resume
   - on_session_finalize

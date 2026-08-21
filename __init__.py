@@ -49,9 +49,9 @@ def _log_err(msg: str) -> None:
 _log("plugin loaded")
 
 
-# ---- per-session baseline: message count at session start ------------------
+# ---- per-session baseline: message count at session start -------------------
 # Tracked so we can skip title generation on /quit if the user added no
-# new messages since the session was resumed / created.
+# new messages since a brand-new session was created.
 
 _session_initial_counts: dict[str, int] = {}
 _generated_sessions: set[str] = set()
@@ -77,11 +77,6 @@ def _record_baseline(**kw: Any) -> None:
 
 def _on_session_start(**kw: Any) -> None:
     """on_session_start hook — records the DB message_count as baseline."""
-    _record_baseline(**kw)
-
-
-def _on_session_resume(**kw: Any) -> None:
-    """on_session_resume hook — records the DB message_count as baseline."""
     _record_baseline(**kw)
 
 
@@ -213,10 +208,17 @@ def _build_title_context(session_db: Any, session_id: str, session: dict[str, An
     return "\n".join(parts), conv
 
 
-def _write_title(session_db: Any, session_id: str, title: str) -> bool:
+def _write_title(session_db: Any, session_id: str, title: str, *, refresh: bool = False) -> bool:
+    source = getattr(session_db, "TITLE_SOURCE_LLM", "llm")
+    if refresh:
+        refresher = getattr(session_db, "refresh_auto_title", None)
+        if refresher is not None:
+            try:
+                return bool(refresher(session_id, title, source=source))
+            except AttributeError:
+                pass
     auto_writer = getattr(session_db, "set_auto_title", None)
     if auto_writer is not None:
-        source = getattr(session_db, "TITLE_SOURCE_LLM", "llm")
         try:
             return bool(auto_writer(session_id, title, source=source))
         except AttributeError:
@@ -302,7 +304,12 @@ def _generate_title_for_session(
         if not title:
             _log("LLM returned empty title — preserving existing title")
             return None
-        if not _write_title(session_db, session_id, title):
+        if not _write_title(
+            session_db,
+            session_id,
+            title,
+            refresh=command == "retitle",
+        ):
             _log(f"title write declined by provenance policy for session={session_id}")
             return None
         with _generation_lock:
@@ -390,6 +397,5 @@ def register(ctx: Any) -> None:
     )
 
     ctx.register_hook("on_session_start", _on_session_start)
-    ctx.register_hook("on_session_resume", _on_session_resume)
     ctx.register_hook("pre_command", _on_pre_command)
     ctx.register_hook("on_session_finalize", _on_session_finalize)

@@ -66,6 +66,12 @@ class FakeDB:
         self.writes.append(("auto", session_id, title, source))
         return True
 
+    def refresh_auto_title(self, session_id, title, *, source):
+        if not self.support_provenance:
+            raise AttributeError("unsupported")
+        self.writes.append(("refresh", session_id, title, source))
+        return True
+
     def set_auto_title_if_empty(self, session_id, title):
         self.writes.append(("legacy-auto", session_id, title))
         return not self.session.get("title")
@@ -127,6 +133,8 @@ def test_registers_finalize_hook_and_manifest_declares_it(plugin):
 
     assert ctx.hooks["on_session_finalize"] is plugin._on_session_finalize
     assert "on_session_finalize" in (PLUGIN_PATH.parent / "plugin.yaml").read_text()
+    assert "on_session_resume" not in ctx.hooks
+    assert "on_session_resume" not in (PLUGIN_PATH.parent / "plugin.yaml").read_text()
 
 
 def test_finalize_uses_session_id_and_db_without_cli(plugin, monkeypatch):
@@ -172,17 +180,6 @@ def test_empty_session_skips_llm(plugin, monkeypatch):
 
     assert llm_calls == []
     assert db.writes == []
-
-
-def test_immediately_resumed_unchanged_session_skips_llm(plugin, monkeypatch):
-    db = FakeDB(messages=messages("old alpha", "old result"))
-    llm_calls = []
-    install_core(monkeypatch, db, llm_calls)
-    plugin._on_session_resume(session_id="session-1")
-
-    plugin._on_session_finalize(session_id="session-1", platform="cli")
-
-    assert llm_calls == []
 
 
 def test_title_input_contains_existing_title_and_all_topics_in_chronological_order(plugin, monkeypatch):
@@ -287,6 +284,19 @@ def test_manual_retitle_also_preserves_human_title(plugin, monkeypatch):
     assert plugin._generate_title(cli, "retitle") is None
     assert llm_calls == []
     assert db.writes == []
+
+
+def test_manual_retitle_refreshes_an_existing_llm_title(plugin, monkeypatch):
+    db = FakeDB(
+        messages=messages("new alpha", "new result"),
+        session={"id": "session-1", "message_count": 2, "title": "Earlier Generated Title", "title_source": "llm"},
+    )
+    llm_calls = []
+    install_core(monkeypatch, db, llm_calls)
+    cli = SimpleNamespace(_session_db=db, session_id="session-1", conversation_history=db.messages, agent=None)
+
+    assert plugin._generate_title(cli, "retitle") == "Complete Session Title"
+    assert db.writes == [("refresh", "session-1", "Complete Session Title", "llm")]
 
 
 def test_older_core_without_topics_or_provenance_uses_compatible_fallback(plugin, monkeypatch):

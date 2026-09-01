@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 import importlib.util
+import sqlite3
 import sys
 import types
 from pathlib import Path
@@ -203,6 +204,7 @@ def test_title_input_contains_existing_title_and_all_topics_in_chronological_ord
     assert prompt.index("Early Alpha") < prompt.index("Middle Beta") < prompt.index("Late Gamma")
     assert "alpha summary" in prompt and "beta summary" in prompt and "gamma summary" in prompt
     assert "state=cold" in prompt and "messages=7" in prompt
+    assert db.writes == [("refresh", "session-1", "Complete Session Title", "llm")]
 
 
 def test_long_history_preserves_early_middle_and_late_keywords(plugin, monkeypatch):
@@ -272,6 +274,59 @@ def test_automatic_finalize_protects_human_title_without_llm_call(plugin, monkey
     assert db.writes == []
 
 
+def test_automatic_finalize_refreshes_existing_llm_title(plugin, monkeypatch):
+    db = FakeDB(
+        messages=messages("new alpha", "new result"),
+        session={"id": "session-1", "message_count": 2, "title": "Earlier Generated Title", "title_source": "llm"},
+    )
+    llm_calls = []
+    install_core(monkeypatch, db, llm_calls)
+
+    plugin._on_session_finalize(session_id="session-1", platform="cli")
+
+    assert len(llm_calls) == 1
+    assert db.writes == [("refresh", "session-1", "Complete Session Title", "llm")]
+
+
+def test_automatic_finalize_protects_legacy_title_without_llm_call(plugin, monkeypatch):
+    db = FakeDB(
+        messages=messages("new alpha", "new result"),
+        session={"id": "session-1", "message_count": 2, "title": "Legacy Title", "title_source": None},
+    )
+    llm_calls = []
+    install_core(monkeypatch, db, llm_calls)
+
+    plugin._on_session_finalize(session_id="session-1", platform="cli")
+
+    assert llm_calls == []
+    assert db.writes == []
+
+
+def test_automatic_finalize_on_old_core_does_not_replace_existing_title(plugin, monkeypatch):
+    class OldDB:
+        def __init__(self):
+            self.writes = []
+
+        def get_session(self, session_id):
+            return {"id": session_id, "message_count": 2, "title": "Earlier Generated Title", "title_source": "llm"}
+
+        def get_messages_as_conversation(self, session_id, **kwargs):
+            return messages("new alpha", "new result")
+
+        def set_session_title(self, session_id, title):
+            self.writes.append((session_id, title))
+            return True
+
+    db = OldDB()
+    llm_calls = []
+    install_core(monkeypatch, db, llm_calls)
+
+    plugin._on_session_finalize(session_id="session-1", platform="cli")
+
+    assert len(llm_calls) == 1
+    assert db.writes == []
+
+
 def test_manual_retitle_also_preserves_human_title(plugin, monkeypatch):
     db = FakeDB(
         messages=messages("new alpha", "new result"),
@@ -281,7 +336,8 @@ def test_manual_retitle_also_preserves_human_title(plugin, monkeypatch):
     install_core(monkeypatch, db, llm_calls)
     cli = SimpleNamespace(_session_db=db, session_id="session-1", conversation_history=db.messages, agent=None)
 
-    assert plugin._generate_title(cli, "retitle") is None
+    result = plugin._generate_title(cli, "retitle")
+    assert result.outcome == plugin._PROTECTED
     assert llm_calls == []
     assert db.writes == []
 
@@ -295,7 +351,8 @@ def test_manual_retitle_refreshes_an_existing_llm_title(plugin, monkeypatch):
     install_core(monkeypatch, db, llm_calls)
     cli = SimpleNamespace(_session_db=db, session_id="session-1", conversation_history=db.messages, agent=None)
 
-    assert plugin._generate_title(cli, "retitle") == "Complete Session Title"
+    result = plugin._generate_title(cli, "retitle")
+    assert (result.outcome, result.title) == (plugin._UPDATED, "Complete Session Title")
     assert db.writes == [("refresh", "session-1", "Complete Session Title", "llm")]
 
 
@@ -322,3 +379,60 @@ def test_older_core_without_topics_or_provenance_uses_compatible_fallback(plugin
 
     assert len(llm_calls) == 1
     assert db.writes == [("session-1", "Complete Session Title")]
+
+
+def test_current_core_fallback_refresh_uses_sessiondb_transaction(plugin):
+    class CurrentCoreDB:
+        TITLE_SOURCE_LLM = "llm"
+
+        def __init__(self):
+            self.conn = sqlite3.connect(":memory:")
+            self.conn.row_factory = sqlite3.Row
+            self.conn.execute("CREATE TABLE sessions (id TEXT PRIMARY KEY, title TEXT UNIQUE, title_source TEXT)")
+            self.conn.execute("INSERT INTO sessions VALUES ('session-1', 'Old LLM Title', 'llm')")
+
+        def get_session(self, session_id):
+            row = self.conn.execute("SELECT * FROM sessions WHERE id = ?", (session_id,)).fetchone()
+            return dict(row) if row else None
+
+        @staticmethod
+        def sanitize_title(title):
+            return title.strip()
+
+        def set_auto_title(self, session_id, title, *, source):
+            raise AssertionError("refresh must use the compatibility transaction, not set_auto_title")
+
+        @staticmethod
+        def _is_compression_ancestor(conn, *, ancestor_id, descendant_id):
+            return False
+
+        def _execute_write(self, operation):
+            result = operation(self.conn)
+            self.conn.commit()
+            return result
+
+    db = CurrentCoreDB()
+
+    assert plugin._write_title(db, "session-1", "Refreshed LLM Title", refresh=True) == plugin._UPDATED
+    assert db.get_session("session-1") == {
+        "id": "session-1", "title": "Refreshed LLM Title", "title_source": "llm"
+    }
+
+
+def test_manual_retitle_after_automatic_rebuild_is_not_deduped(plugin, monkeypatch):
+    db = FakeDB(messages=messages("alpha", "result"))
+    llm_calls = []
+    install_core(monkeypatch, db, llm_calls)
+    cli = SimpleNamespace(_session_db=db, session_id="session-1", conversation_history=db.messages, agent=None)
+
+    assert plugin._generate_title(cli, "finalize").outcome == plugin._UPDATED
+    assert plugin._generate_title(cli, "retitle").outcome == plugin._UPDATED
+    assert len(llm_calls) == 2
+
+
+def test_manual_retitle_on_old_core_reports_unsupported_compatibility(plugin):
+    class OldDB:
+        def get_session(self, session_id):
+            return {"id": session_id, "title": "Unattributed Old Title", "message_count": 2}
+
+    assert plugin._write_title(OldDB(), "session-1", "New Title", refresh=True) == plugin._UNSUPPORTED

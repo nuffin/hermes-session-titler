@@ -59,6 +59,22 @@ _generation_in_progress: set[str] = set()
 _generation_lock = threading.Lock()
 
 
+class _TitleResult:
+    """The explicit result of one generation attempt, for CLI feedback."""
+
+    def __init__(self, outcome: str, title: str | None = None) -> None:
+        self.outcome = outcome
+        self.title = title
+
+
+_UPDATED = "updated"
+_PROTECTED = "protected"
+_IN_PROGRESS = "in_progress"
+_UNSUPPORTED = "unsupported"
+_FAILED = "failed"
+_NO_CONTEXT = "no_context"
+
+
 def _record_baseline(**kw: Any) -> None:
     """Record the DB message_count as baseline for a session (start or resume)."""
     session_id = kw.get("session_id")
@@ -208,30 +224,93 @@ def _build_title_context(session_db: Any, session_id: str, session: dict[str, An
     return "\n".join(parts), conv
 
 
-def _write_title(session_db: Any, session_id: str, title: str, *, refresh: bool = False) -> bool:
-    source = getattr(session_db, "TITLE_SOURCE_LLM", "llm")
-    if refresh:
+def _compat_refresh_auto_title(session_db: Any, session_id: str, title: str, source: str) -> bool:
+    """Refresh only an existing LLM title through current SessionDB primitives.
+
+    This intentionally mirrors the core's transaction-local title invariants
+    without opening the state database itself. It is a bridge for cores that
+    expose provenance and ``_execute_write`` but have not yet published
+    ``refresh_auto_title``. Any other stored provenance, including NULL legacy
+    provenance, is refused.
+    """
+    execute_write = getattr(session_db, "_execute_write", None)
+    sanitize = getattr(session_db, "sanitize_title", None)
+    compression_ancestor = getattr(session_db, "_is_compression_ancestor", None)
+    if not all(callable(value) for value in (execute_write, sanitize, compression_ancestor)):
+        raise AttributeError("no provenance-safe refresh transaction available")
+    assert callable(execute_write) and callable(sanitize) and callable(compression_ancestor)
+
+    cleaned = sanitize(title)
+    if not cleaned:
+        return False
+
+    def _do(conn: Any) -> int:
+        current = conn.execute(
+            "SELECT title, title_source FROM sessions WHERE id = ?", (session_id,)
+        ).fetchone()
+        if current is None or current["title"] is None or current["title_source"] != source:
+            return 0
+        conflict = conn.execute(
+            "SELECT id FROM sessions WHERE title = ? AND id != ?", (cleaned, session_id)
+        ).fetchone()
+        if conflict:
+            conflict_id = conflict["id"]
+            if compression_ancestor(conn, ancestor_id=conflict_id, descendant_id=session_id):
+                conn.execute("UPDATE sessions SET title = NULL WHERE id = ?", (conflict_id,))
+            else:
+                raise ValueError(f"Title '{cleaned}' is already in use by session {conflict_id}")
+        cursor = conn.execute(
+            "UPDATE sessions SET title = ?, title_source = ? "
+            "WHERE id = ? AND title IS ? AND title_source IS ?",
+            (cleaned, source, session_id, current["title"], current["title_source"]),
+        )
+        return cursor.rowcount
+
+    return bool(execute_write(_do))
+
+
+def _write_title(session_db: Any, session_id: str, title: str, *, refresh: bool = False) -> str:
+    """Write an automatic title and report a provenance-aware outcome."""
+    source = getattr(session_db, "TITLE_SOURCE_LLM", None)
+    auto_writer = getattr(session_db, "set_auto_title", None)
+    session = session_db.get_session(session_id) or {}
+    existing_title = session.get("title")
+    existing_source = session.get("title_source")
+
+    if refresh and existing_title:
+        # Cores without a provenance API cannot safely distinguish an old LLM
+        # title from a user title. Do not guess or use set_session_title.
+        if not source or not callable(auto_writer):
+            return _UNSUPPORTED
+        if existing_source in ("user", None) or existing_source != source:
+            return _PROTECTED
         refresher = getattr(session_db, "refresh_auto_title", None)
-        if refresher is not None:
+        if callable(refresher):
             try:
-                return bool(refresher(session_id, title, source=source))
+                return _UPDATED if refresher(session_id, title, source=source) else _PROTECTED
             except AttributeError:
                 pass
-    auto_writer = getattr(session_db, "set_auto_title", None)
-    if auto_writer is not None:
         try:
-            return bool(auto_writer(session_id, title, source=source))
+            return _UPDATED if _compat_refresh_auto_title(session_db, session_id, title, source) else _PROTECTED
+        except AttributeError:
+            return _UNSUPPORTED
+
+    if callable(auto_writer) and source:
+        try:
+            return _UPDATED if auto_writer(session_id, title, source=source) else _PROTECTED
         except AttributeError:
             pass
     legacy_auto_writer = getattr(session_db, "set_auto_title_if_empty", None)
-    if legacy_auto_writer is not None:
-        return bool(legacy_auto_writer(session_id, title))
+    if callable(legacy_auto_writer):
+        return _UPDATED if legacy_auto_writer(session_id, title) else _PROTECTED
     # Oldest cores have no provenance-safe automatic write. Never replace a
     # pre-existing title through that compatibility path.
-    session = session_db.get_session(session_id) or {}
-    if session.get("title"):
-        return False
-    return bool(session_db.set_session_title(session_id, title))
+    if existing_title:
+        return _UNSUPPORTED
+    try:
+        return _UPDATED if session_db.set_session_title(session_id, title) else _FAILED
+    except Exception:
+        return _FAILED
 
 
 def _clean_title(response: Any) -> str:
@@ -255,34 +334,36 @@ def _generate_title_for_session(
     command: str,
     fallback_conv: list | None = None,
     runtime: Any = None,
-) -> str | None:
+) -> _TitleResult:
     """Run the unified DB-first title pipeline for one session."""
     session = session_db.get_session(session_id) if hasattr(session_db, "get_session") else None
     if not session:
         _log(f"session {session_id} not found — skipping title generation")
-        return None
+        return _TitleResult(_FAILED)
     if session.get("title") and session.get("title_source") in ("user", None):
         _log(f"human or legacy title already holds session={session_id} — preserving")
-        return None
+        return _TitleResult(_PROTECTED)
 
     context, conv = _build_title_context(session_db, session_id, session, fallback_conv)
     message_count = session.get("message_count")
     if message_count == 0 and not conv:
         _log(f"no messages in session {session_id} — skipping title generation")
-        return None
+        return _TitleResult(_NO_CONTEXT)
     if not conv and not _load_topics(session_db, session_id):
         _log(f"no trustworthy title context for session {session_id} — preserving existing title")
-        return None
+        return _TitleResult(_NO_CONTEXT)
 
     baseline = _session_initial_counts.get(session_id)
     if command != "retitle" and baseline is not None and message_count is not None and message_count <= baseline:
         _log(f"no new messages (db={message_count}, baseline={baseline}) — skipping")
-        return None
+        return _TitleResult(_NO_CONTEXT)
 
     with _generation_lock:
-        if session_id in _generated_sessions or session_id in _generation_in_progress:
+        if session_id in _generation_in_progress or (
+            command != "retitle" and session_id in _generated_sessions
+        ):
             _log(f"title already generated or in progress for session={session_id} — skipping duplicate")
-            return None
+            return _TitleResult(_IN_PROGRESS)
         _generation_in_progress.add(session_id)
 
     try:
@@ -303,35 +384,36 @@ def _generate_title_for_session(
         title = _clean_title(response)
         if not title:
             _log("LLM returned empty title — preserving existing title")
-            return None
-        if not _write_title(
+            return _TitleResult(_FAILED)
+        outcome = _write_title(
             session_db,
             session_id,
             title,
-            refresh=command == "retitle",
-        ):
+            refresh=command in {"retitle", "finalize"},
+        )
+        if outcome != _UPDATED:
             _log(f"title write declined by provenance policy for session={session_id}")
-            return None
+            return _TitleResult(outcome)
         with _generation_lock:
             _generated_sessions.add(session_id)
         _log(f"set title='{title}' (session={session_id})")
-        return title
+        return _TitleResult(_UPDATED, title)
     except Exception as exc:
         _log_err(f"title generation failed: {exc}")
         _log_err(traceback.format_exc())
-        return None
+        return _TitleResult(_FAILED)
     finally:
         with _generation_lock:
             _generation_in_progress.discard(session_id)
 
 
-def _generate_title(cli: Any, command: str) -> str | None:
+def _generate_title(cli: Any, command: str) -> _TitleResult:
     """Generate from a live CLI while keeping durable DB history authoritative."""
     session_db = getattr(cli, "_session_db", None)
     session_id = getattr(cli, "session_id", None)
     if not session_db or not session_id:
         _log(f"missing data: session_db={bool(session_db)}, session_id={bool(session_id)} — skipping")
-        return None
+        return _TitleResult(_FAILED)
     runtime = None
     agent = getattr(cli, "agent", None)
     if agent is not None:
@@ -376,9 +458,17 @@ def _handle_retitle_command(args: str) -> str:
     if cli is None:
         return "No CLI context available — use /quit to generate title instead."
 
-    title = _generate_title(cli, "retitle")
-    if title:
-        return f"Session title updated: {title}"
+    result = _generate_title(cli, "retitle")
+    if result.outcome == _UPDATED:
+        return f"Session title updated: {result.title}"
+    if result.outcome == _PROTECTED:
+        return "Title retained: it has a user-selected or legacy protected title."
+    if result.outcome == _IN_PROGRESS:
+        return "Title generation is already in progress; no duplicate request was started."
+    if result.outcome == _UNSUPPORTED:
+        return "Title retained: this Hermes version cannot safely refresh an existing automatic title."
+    if result.outcome == _NO_CONTEXT:
+        return "Title retained: there is not enough durable session context to retitle."
     return "Title generation failed — check logs."
 
 

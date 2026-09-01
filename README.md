@@ -34,10 +34,12 @@ Restart Hermes.
 - **EOF/Ctrl-D or `/quit`** — one automatic, topic-aware title attempt runs at finalization
 - **`/retitle`** — manually run the same DB-first title pipeline
 
-Automatic and manual plugin retitling preserve titles whose provenance is
-`user`. On older Hermes cores without provenance support, any existing title is
-also preserved conservatively. Topic summaries and provenance APIs are
-capability-detected, so the plugin remains compatible with older cores.
+Automatic finalization and `/retitle` refresh an existing `llm` title, while preserving titles whose provenance is `user`. They prefer the future public
+`SessionDB.refresh_auto_title` API and, on current provenance-capable Hermes,
+uses only SessionDB's transaction/sanitization primitives as a constrained
+compatibility bridge. Legacy (`NULL`) provenance and user titles are never
+replaced. On older cores that cannot make this distinction, existing titles are
+retained and `/retitle` reports that safe refresh is unsupported.
 
 ## License
 

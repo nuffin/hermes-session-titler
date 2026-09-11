@@ -269,8 +269,61 @@ def _compat_refresh_auto_title(session_db: Any, session_id: str, title: str, sou
     return bool(execute_write(_do))
 
 
-def _write_title(session_db: Any, session_id: str, title: str, *, refresh: bool = False) -> str:
+def _force_write_title(session_db: Any, session_id: str, title: str) -> str:
+    """Replace a title at explicit user request, recording LLM provenance.
+
+    ``/retitle --force`` intentionally overrides user and legacy title
+    protection.  Use one compare-and-swap transaction when the current core
+    exposes its state primitives, so a concurrent manual rename still wins.
+    Older cores fall back to their public user-title setter; the next automatic
+    refresh may then be protected, but another explicit force remains possible.
+    """
+    source = getattr(session_db, "TITLE_SOURCE_LLM", None)
+    execute_write = getattr(session_db, "_execute_write", None)
+    sanitize = getattr(session_db, "sanitize_title", None)
+    compression_ancestor = getattr(session_db, "_is_compression_ancestor", None)
+    if source and all(callable(value) for value in (execute_write, sanitize, compression_ancestor)):
+        assert callable(execute_write) and callable(sanitize) and callable(compression_ancestor)
+        cleaned = sanitize(title)
+        if not cleaned:
+            return _FAILED
+
+        def _do(conn: Any) -> int:
+            current = conn.execute(
+                "SELECT title, title_source FROM sessions WHERE id = ?", (session_id,)
+            ).fetchone()
+            if current is None:
+                return 0
+            conflict = conn.execute(
+                "SELECT id FROM sessions WHERE title = ? AND id != ?", (cleaned, session_id)
+            ).fetchone()
+            if conflict:
+                conflict_id = conflict["id"]
+                if compression_ancestor(conn, ancestor_id=conflict_id, descendant_id=session_id):
+                    conn.execute("UPDATE sessions SET title = NULL WHERE id = ?", (conflict_id,))
+                else:
+                    raise ValueError(f"Title '{cleaned}' is already in use by session {conflict_id}")
+            cursor = conn.execute(
+                "UPDATE sessions SET title = ?, title_source = ? "
+                "WHERE id = ? AND title IS ? AND title_source IS ?",
+                (cleaned, source, session_id, current["title"], current["title_source"]),
+            )
+            return cursor.rowcount
+
+        return _UPDATED if execute_write(_do) else _PROTECTED
+
+    try:
+        return _UPDATED if session_db.set_session_title(session_id, title) else _FAILED
+    except Exception:
+        return _FAILED
+
+
+def _write_title(
+    session_db: Any, session_id: str, title: str, *, refresh: bool = False, force: bool = False
+) -> str:
     """Write an automatic title and report a provenance-aware outcome."""
+    if force:
+        return _force_write_title(session_db, session_id, title)
     source = getattr(session_db, "TITLE_SOURCE_LLM", None)
     auto_writer = getattr(session_db, "set_auto_title", None)
     session = session_db.get_session(session_id) or {}
@@ -334,27 +387,28 @@ def _generate_title_for_session(
     command: str,
     fallback_conv: list | None = None,
     runtime: Any = None,
+    force: bool = False,
 ) -> _TitleResult:
     """Run the unified DB-first title pipeline for one session."""
     session = session_db.get_session(session_id) if hasattr(session_db, "get_session") else None
     if not session:
         _log(f"session {session_id} not found — skipping title generation")
         return _TitleResult(_FAILED)
-    if session.get("title") and session.get("title_source") in ("user", None):
+    if not force and session.get("title") and session.get("title_source") in ("user", None):
         _log(f"human or legacy title already holds session={session_id} — preserving")
         return _TitleResult(_PROTECTED)
 
     context, conv = _build_title_context(session_db, session_id, session, fallback_conv)
     message_count = session.get("message_count")
-    if message_count == 0 and not conv:
+    if not force and message_count == 0 and not conv:
         _log(f"no messages in session {session_id} — skipping title generation")
         return _TitleResult(_NO_CONTEXT)
-    if not conv and not _load_topics(session_db, session_id):
+    if not force and not conv and not _load_topics(session_db, session_id):
         _log(f"no trustworthy title context for session {session_id} — preserving existing title")
         return _TitleResult(_NO_CONTEXT)
 
     baseline = _session_initial_counts.get(session_id)
-    if command != "retitle" and baseline is not None and message_count is not None and message_count <= baseline:
+    if not force and command != "retitle" and baseline is not None and message_count is not None and message_count <= baseline:
         _log(f"no new messages (db={message_count}, baseline={baseline}) — skipping")
         return _TitleResult(_NO_CONTEXT)
 
@@ -390,6 +444,7 @@ def _generate_title_for_session(
             session_id,
             title,
             refresh=command in {"retitle", "finalize"},
+            force=force,
         )
         if outcome != _UPDATED:
             _log(f"title write declined by provenance policy for session={session_id}")
@@ -407,7 +462,7 @@ def _generate_title_for_session(
             _generation_in_progress.discard(session_id)
 
 
-def _generate_title(cli: Any, command: str) -> _TitleResult:
+def _generate_title(cli: Any, command: str, *, force: bool = False) -> _TitleResult:
     """Generate from a live CLI while keeping durable DB history authoritative."""
     session_db = getattr(cli, "_session_db", None)
     session_id = getattr(cli, "session_id", None)
@@ -424,6 +479,7 @@ def _generate_title(cli: Any, command: str) -> _TitleResult:
         command=command,
         fallback_conv=getattr(cli, "conversation_history", None),
         runtime=runtime,
+        force=force,
     )
 
 
@@ -458,9 +514,14 @@ def _handle_retitle_command(args: str) -> str:
     if cli is None:
         return "No CLI context available — use /quit to generate title instead."
 
-    result = _generate_title(cli, "retitle")
+    parsed_args = args.strip().split()
+    if any(argument != "--force" for argument in parsed_args) or len(parsed_args) > 1:
+        return "Usage: /retitle [--force]"
+    force = parsed_args == ["--force"]
+    result = _generate_title(cli, "retitle", force=force)
     if result.outcome == _UPDATED:
-        return f"Session title updated: {result.title}"
+        prefix = "Session title force-updated" if force else "Session title updated"
+        return f"{prefix}: {result.title}"
     if result.outcome == _PROTECTED:
         return "Title retained: it has a user-selected or legacy protected title."
     if result.outcome == _IN_PROGRESS:
@@ -483,7 +544,8 @@ def register(ctx: Any) -> None:
         name="retitle",
         handler=_handle_retitle_command,
         description="Regenerate the session title immediately from full conversation",
-        args_hint="",
+        args_hint="[--force]",
+        argument_mode="options",
     )
 
     ctx.register_hook("on_session_start", _on_session_start)

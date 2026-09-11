@@ -342,6 +342,34 @@ def test_manual_retitle_also_preserves_human_title(plugin, monkeypatch):
     assert db.writes == []
 
 
+def test_manual_retitle_force_replaces_human_title(plugin, monkeypatch):
+    db = FakeDB(
+        messages=messages("new alpha", "new result"),
+        session={"id": "session-1", "message_count": 2, "title": "Human Chosen Title", "title_source": "user"},
+    )
+    llm_calls = []
+    install_core(monkeypatch, db, llm_calls)
+    cli = SimpleNamespace(_session_db=db, session_id="session-1", conversation_history=db.messages, agent=None)
+
+    result = plugin._generate_title(cli, "retitle", force=True)
+
+    assert (result.outcome, result.title) == (plugin._UPDATED, "Complete Session Title")
+    assert len(llm_calls) == 1
+    assert db.writes == [("legacy", "session-1", "Complete Session Title")]
+
+
+def test_force_retitle_rebuilds_even_without_durable_context(plugin, monkeypatch):
+    db = FakeDB(messages=[], session={"id": "session-1", "message_count": 0, "title": "Human Title", "title_source": "user"})
+    llm_calls = []
+    install_core(monkeypatch, db, llm_calls)
+    cli = SimpleNamespace(_session_db=db, session_id="session-1", conversation_history=[], agent=None)
+
+    result = plugin._generate_title(cli, "retitle", force=True)
+
+    assert result.outcome == plugin._UPDATED
+    assert len(llm_calls) == 1
+
+
 def test_manual_retitle_refreshes_an_existing_llm_title(plugin, monkeypatch):
     db = FakeDB(
         messages=messages("new alpha", "new result"),
@@ -416,6 +444,41 @@ def test_current_core_fallback_refresh_uses_sessiondb_transaction(plugin):
     assert plugin._write_title(db, "session-1", "Refreshed LLM Title", refresh=True) == plugin._UPDATED
     assert db.get_session("session-1") == {
         "id": "session-1", "title": "Refreshed LLM Title", "title_source": "llm"
+    }
+
+
+def test_force_retitle_current_core_replaces_user_title_with_llm_provenance(plugin):
+    class CurrentCoreDB:
+        TITLE_SOURCE_LLM = "llm"
+
+        def __init__(self):
+            self.conn = sqlite3.connect(":memory:")
+            self.conn.row_factory = sqlite3.Row
+            self.conn.execute("CREATE TABLE sessions (id TEXT PRIMARY KEY, title TEXT UNIQUE, title_source TEXT)")
+            self.conn.execute("INSERT INTO sessions VALUES ('session-1', 'Human Title', 'user')")
+
+        def get_session(self, session_id):
+            row = self.conn.execute("SELECT * FROM sessions WHERE id = ?", (session_id,)).fetchone()
+            return dict(row) if row else None
+
+        @staticmethod
+        def sanitize_title(title):
+            return title.strip()
+
+        @staticmethod
+        def _is_compression_ancestor(conn, *, ancestor_id, descendant_id):
+            return False
+
+        def _execute_write(self, operation):
+            result = operation(self.conn)
+            self.conn.commit()
+            return result
+
+    db = CurrentCoreDB()
+
+    assert plugin._write_title(db, "session-1", "Forced LLM Title", force=True) == plugin._UPDATED
+    assert db.get_session("session-1") == {
+        "id": "session-1", "title": "Forced LLM Title", "title_source": "llm"
     }
 
 

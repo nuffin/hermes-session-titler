@@ -33,6 +33,9 @@ Restart Hermes.
 
 - **EOF/Ctrl-D or `/quit`** — one automatic, topic-aware title attempt runs at finalization
 - **`/retitle`** — manually run the same DB-first title pipeline
+- **`/retitle --force`** — recalculate and replace the title even when it is a
+  user-authored, legacy, empty-context, or otherwise protected title. It still
+  cannot succeed if the session no longer exists or title generation/write fails.
 
 Automatic finalization and `/retitle` refresh an existing `llm` title, while preserving titles whose provenance is `user`. They prefer the future public
 `SessionDB.refresh_auto_title` API and, on current provenance-capable Hermes,
@@ -40,6 +43,12 @@ uses only SessionDB's transaction/sanitization primitives as a constrained
 compatibility bridge. Legacy (`NULL`) provenance and user titles are never
 replaced. On older cores that cannot make this distinction, existing titles are
 retained and `/retitle` reports that safe refresh is unsupported.
+
+`--force` is intentionally an explicit override: on provenance-capable Hermes
+it writes the regenerated title with `llm` provenance in one compare-and-swap
+transaction. On older Hermes versions it uses the public title setter, which
+records user provenance; future automatic updates remain protected until the
+next explicit `/retitle --force`.
 
 ## License
 
